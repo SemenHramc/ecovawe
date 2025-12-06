@@ -4,10 +4,9 @@ import React, { useEffect, useRef } from 'react';
 // without requiring heavy external dependencies for this specific environment.
 
 const GLOBE_CONFIG = {
-  radius: 220,
-  dotSize: 1.8,
+  dotSize: 1.1,
   rotationSpeed: 0.001,
-  dotsCount: 700,
+  dotsCount: 1300,
   colors: {
     base: '#2C4531', // Taiga
     highlight: '#D4E157', // Solar Lime
@@ -27,14 +26,21 @@ const Globe: React.FC = () => {
 
     let width = canvas.parentElement?.clientWidth || 600;
     let height = canvas.parentElement?.clientHeight || 600;
-    
-    // Adjust for HiDPI displays
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = width * dpr;
-    canvas.height = height * dpr;
-    canvas.style.width = `${width}px`;
-    canvas.style.height = `${height}px`;
-    ctx.scale(dpr, dpr);
+    let dpr = window.devicePixelRatio || 1;
+
+    const resizeCanvas = () => {
+      width = canvas.parentElement?.clientWidth || 600;
+      height = canvas.parentElement?.clientHeight || 600;
+      dpr = window.devicePixelRatio || 1;
+      canvas.width = width * dpr;
+      canvas.height = height * dpr;
+      canvas.style.width = `${width}px`;
+      canvas.style.height = `${height}px`;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.scale(dpr, dpr);
+    };
+
+    resizeCanvas();
 
     let rotation = 0;
     
@@ -59,7 +65,7 @@ const Globe: React.FC = () => {
       dots.push({ x, y, z, color });
     }
 
-    let animationFrameId: number;
+    let animationFrameId: number | null = null;
 
     const render = () => {
       ctx.clearRect(0, 0, width, height);
@@ -67,6 +73,7 @@ const Globe: React.FC = () => {
       // Center of the canvas
       const cx = width / 2;
       const cy = height / 2;
+      const radius = Math.min(width, height) * 0.35;
 
       rotation += GLOBE_CONFIG.rotationSpeed;
 
@@ -80,9 +87,9 @@ const Globe: React.FC = () => {
         const rotatedZ = dot.x * Math.sin(rotation) + dot.z * Math.cos(rotation);
         
         // 3D Projection
-        const scale = 350 / (350 - rotatedZ * GLOBE_CONFIG.radius); // Perspective
-        const px = cx + rotatedX * GLOBE_CONFIG.radius;
-        const py = cy + dot.y * GLOBE_CONFIG.radius;
+        const scale = 350 / (350 - rotatedZ * radius); // Perspective
+        const px = cx + rotatedX * radius * scale;
+        const py = cy + dot.y * radius * scale;
         
         return { x: px, y: py, z: rotatedZ, color: dot.color, scale };
       });
@@ -92,10 +99,11 @@ const Globe: React.FC = () => {
 
       projectedDots.forEach(p => {
         // Only draw dots on the "front" of the sphere for cleaner look, or draw all with opacity
-        const alpha = p.z > 0 ? 1 : 0.2; 
+        const alpha = p.z > 0 ? 1 : 0.12; 
         
         ctx.beginPath();
-        ctx.arc(p.x, p.y, GLOBE_CONFIG.dotSize * (p.z > 0 ? 1.5 : 1), 0, Math.PI * 2);
+        const dotRadius = GLOBE_CONFIG.dotSize * (p.z > 0 ? 1.3 : 0.65) * p.scale;
+        ctx.arc(p.x, p.y, dotRadius, 0, Math.PI * 2);
         ctx.fillStyle = p.color;
         ctx.globalAlpha = alpha;
         ctx.fill();
@@ -115,8 +123,28 @@ const Globe: React.FC = () => {
 
     render();
 
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden' && animationFrameId !== null) {
+        cancelAnimationFrame(animationFrameId);
+        animationFrameId = null;
+      } else if (document.visibilityState === 'visible' && animationFrameId === null) {
+        render();
+      }
+    };
+
+    const handleResize = () => {
+      resizeCanvas();
+    };
+
+    window.addEventListener('resize', handleResize);
+    document.addEventListener('visibilitychange', handleVisibility);
+
     return () => {
-      cancelAnimationFrame(animationFrameId);
+      if (animationFrameId !== null) {
+        cancelAnimationFrame(animationFrameId);
+      }
+      window.removeEventListener('resize', handleResize);
+      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, []);
 
