@@ -14,6 +14,41 @@ const GLOBE_CONFIG = {
   }
 };
 
+function loadMask(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = reject;
+    img.src = src;
+  });
+}
+
+function sampleIsLand(img: HTMLImageElement, threshold = 220) {
+  const canvas = document.createElement('canvas');
+  canvas.width = img.naturalWidth;
+  canvas.height = img.naturalHeight;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return () => true;
+  ctx.drawImage(img, 0, 0);
+  const { data, width, height } = ctx.getImageData(0, 0, canvas.width, canvas.height);
+
+  return (lat: number, lon: number) => {
+    // lat [-pi/2, pi/2], lon [-pi, pi]
+    const u = (lon + Math.PI) / (2 * Math.PI);
+    const v = (Math.PI / 2 - lat) / Math.PI;
+    const x = Math.min(width - 1, Math.max(0, Math.floor(u * width)));
+    const y = Math.min(height - 1, Math.max(0, Math.floor(v * height)));
+    const idx = (y * width + x) * 4;
+    const r = data[idx];
+    const g = data[idx + 1];
+    const b = data[idx + 2];
+    const a = data[idx + 3];
+    const lum = (r + g + b) / 3;
+    // If alpha is 0, treat as water; otherwise threshold by luminance
+    return a > 0 && lum < threshold;
+  };
+}
+
 const Globe: React.FC = () => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
@@ -40,111 +75,130 @@ const Globe: React.FC = () => {
       ctx.scale(dpr, dpr);
     };
 
-    resizeCanvas();
-
-    let rotation = 0;
-    
-    // Generate random points on a sphere
-    const dots: { x: number; y: number; z: number; color: string }[] = [];
-    const phi = Math.PI * (3 - Math.sqrt(5)); // Golden angle
-
-    for (let i = 0; i < GLOBE_CONFIG.dotsCount; i++) {
-      const y = 1 - (i / (GLOBE_CONFIG.dotsCount - 1)) * 2; // y goes from 1 to -1
-      const radiusAtY = Math.sqrt(1 - y * y);
-      const theta = phi * i;
-
-      const x = Math.cos(theta) * radiusAtY;
-      const z = Math.sin(theta) * radiusAtY;
-
-      // Randomly assign colors based on "density" logic or pure random
-      let color = GLOBE_CONFIG.colors.base;
-      const rand = Math.random();
-      if (rand > 0.90) color = GLOBE_CONFIG.colors.highlight;
-      else if (rand > 0.85) color = GLOBE_CONFIG.colors.accent;
-
-      dots.push({ x, y, z, color });
-    }
-
     let animationFrameId: number | null = null;
+    let cancelled = false;
 
-    const render = () => {
-      ctx.clearRect(0, 0, width, height);
-      
-      // Center of the canvas
-      const cx = width / 2;
-      const cy = height / 2;
-      const radius = Math.min(width, height) * 0.35;
-
-      rotation += GLOBE_CONFIG.rotationSpeed;
-
-      // Sort dots by Z depth so back dots are drawn first (simple painter's algorithm)
-      // We need to project them first to sort correctly, but for a simple sphere, 
-      // just rotating and checking Z is enough.
-      
-      const projectedDots = dots.map(dot => {
-        // Rotate around Y axis
-        const rotatedX = dot.x * Math.cos(rotation) - dot.z * Math.sin(rotation);
-        const rotatedZ = dot.x * Math.sin(rotation) + dot.z * Math.cos(rotation);
-        
-        // 3D Projection
-        const scale = 350 / (350 - rotatedZ * radius); // Perspective
-        const px = cx + rotatedX * radius * scale;
-        const py = cy + dot.y * radius * scale;
-        
-        return { x: px, y: py, z: rotatedZ, color: dot.color, scale };
-      });
-
-      // Draw lines between close neighbors (optional, adds "network" feel)
-      // Skipped for performance in this specific MVP, focusing on dots.
-
-      projectedDots.forEach(p => {
-        // Only draw dots on the "front" of the sphere for cleaner look, or draw all with opacity
-        const alpha = p.z > 0 ? 1 : 0.12; 
-        
-        ctx.beginPath();
-        const dotRadius = GLOBE_CONFIG.dotSize * (p.z > 0 ? 1.3 : 0.65) * p.scale;
-        ctx.arc(p.x, p.y, dotRadius, 0, Math.PI * 2);
-        ctx.fillStyle = p.color;
-        ctx.globalAlpha = alpha;
-        ctx.fill();
-        
-        // Glow effect for highlight dots on front
-        if (p.color === GLOBE_CONFIG.colors.highlight && p.z > 0.2) {
-            ctx.shadowBlur = 10;
-            ctx.shadowColor = GLOBE_CONFIG.colors.highlight;
-            ctx.fill();
-            ctx.shadowBlur = 0;
-        }
-      });
-      
-      ctx.globalAlpha = 1; // Reset
-      animationFrameId = requestAnimationFrame(render);
-    };
-
-    render();
-
-    const handleVisibility = () => {
-      if (document.visibilityState === 'hidden' && animationFrameId !== null) {
-        cancelAnimationFrame(animationFrameId);
-        animationFrameId = null;
-      } else if (document.visibilityState === 'visible' && animationFrameId === null) {
-        render();
-      }
-    };
-
-    const handleResize = () => {
+    const start = async () => {
       resizeCanvas();
+
+      // Load land mask
+      let isLand = (_lat: number, _lon: number) => true;
+      try {
+        const img = await loadMask('/world-mask.png');
+        isLand = sampleIsLand(img);
+      } catch (e) {
+        // Fallback: full sphere if mask fails
+        console.warn('Globe mask failed to load, falling back to full sphere', e);
+      }
+
+      if (cancelled) return;
+
+      let rotation = 0;
+      const dots: { x: number; y: number; z: number; color: string }[] = [];
+      const target = GLOBE_CONFIG.dotsCount;
+      const maxAttempts = target * 12;
+      let attempts = 0;
+
+      while (dots.length < target && attempts < maxAttempts) {
+        attempts += 1;
+        const lon = Math.random() * Math.PI * 2 - Math.PI; // -pi..pi
+        const lat = Math.asin(Math.random() * 2 - 1); // -pi/2..pi/2
+        if (!isLand(lat, lon)) continue;
+
+        // Convert lat/lon to cartesian on unit sphere
+        const x = Math.cos(lat) * Math.cos(lon);
+        const y = Math.sin(lat);
+        const z = Math.cos(lat) * Math.sin(lon);
+
+        let color = GLOBE_CONFIG.colors.base;
+        const rand = Math.random();
+        if (rand > 0.92) color = GLOBE_CONFIG.colors.highlight;
+        else if (rand > 0.86) color = GLOBE_CONFIG.colors.accent;
+
+        dots.push({ x, y, z, color });
+      }
+
+      const render = () => {
+        ctx.clearRect(0, 0, width, height);
+        
+        // Center of the canvas
+        const cx = width / 2;
+        const cy = height / 2;
+        const radius = Math.min(width, height) * 0.35;
+
+        rotation += GLOBE_CONFIG.rotationSpeed;
+
+        const projectedDots = dots.map(dot => {
+          // Rotate around Y axis
+          const rotatedX = dot.x * Math.cos(rotation) - dot.z * Math.sin(rotation);
+          const rotatedZ = dot.x * Math.sin(rotation) + dot.z * Math.cos(rotation);
+          
+          // 3D Projection
+          const scale = 350 / (350 - rotatedZ * radius); // Perspective
+          const px = cx + rotatedX * radius * scale;
+          const py = cy + dot.y * radius * scale;
+          
+          return { x: px, y: py, z: rotatedZ, color: dot.color, scale };
+        });
+
+        projectedDots.forEach(p => {
+          const alpha = p.z > 0 ? 1 : 0.12; 
+          
+          ctx.beginPath();
+          const dotRadius = GLOBE_CONFIG.dotSize * (p.z > 0 ? 1.3 : 0.65) * p.scale;
+          ctx.arc(p.x, p.y, dotRadius, 0, Math.PI * 2);
+          ctx.fillStyle = p.color;
+          ctx.globalAlpha = alpha;
+          ctx.fill();
+          
+          if (p.color === GLOBE_CONFIG.colors.highlight && p.z > 0.2) {
+              ctx.shadowBlur = 10;
+              ctx.shadowColor = GLOBE_CONFIG.colors.highlight;
+              ctx.fill();
+              ctx.shadowBlur = 0;
+          }
+        });
+        
+        ctx.globalAlpha = 1; // Reset
+        animationFrameId = requestAnimationFrame(render);
+      };
+
+      render();
+
+      const handleVisibility = () => {
+        if (document.visibilityState === 'hidden' && animationFrameId !== null) {
+          cancelAnimationFrame(animationFrameId);
+          animationFrameId = null;
+        } else if (document.visibilityState === 'visible' && animationFrameId === null) {
+          render();
+        }
+      };
+
+      const handleResize = () => {
+        resizeCanvas();
+      };
+
+      window.addEventListener('resize', handleResize);
+      document.addEventListener('visibilitychange', handleVisibility);
+
+      return () => {
+        if (animationFrameId !== null) cancelAnimationFrame(animationFrameId);
+        window.removeEventListener('resize', handleResize);
+        document.removeEventListener('visibilitychange', handleVisibility);
+      };
     };
 
-    window.addEventListener('resize', handleResize);
-    document.addEventListener('visibilitychange', handleVisibility);
+    let cleanup: (() => void) | undefined;
+    start().then((fn) => {
+      cleanup = fn;
+    });
 
     return () => {
+      cancelled = true;
+      if (cleanup) cleanup();
       if (animationFrameId !== null) {
         cancelAnimationFrame(animationFrameId);
       }
-      window.removeEventListener('resize', handleResize);
-      document.removeEventListener('visibilitychange', handleVisibility);
     };
   }, []);
 
